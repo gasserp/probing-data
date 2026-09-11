@@ -85,8 +85,11 @@ are cleaned up before the workflow deliberately fails visibly.
 ## Bootstrap and required configuration
 
 The initial registry contains no sources. The scheduled workflow validates the
-empty repository locally but skips Azure login and download until a reviewed
-entry has `enabled: true`; it cannot accidentally accept a placeholder source.
+empty repository locally but skips Azure login and download while the
+`sources` array is empty; it cannot accidentally accept a placeholder source.
+Once the registry is non-empty, Azure candidates are always downloaded and
+validated. This includes an all-disabled registry: its blobs quarantine and
+cannot be accepted.
 
 Before enabling the first source:
 
