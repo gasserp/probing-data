@@ -1,0 +1,326 @@
+name: Ingest telemetry
+
+on:
+  schedule:
+    - cron: "17 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  id-token: write
+
+concurrency:
+  group: probing-data-main-ingestion
+  cancel-in-progress: false
+
+env:
+  PROBING_INGEST_REF: bee0080565fb33724300a28dd1bb6c9067b9825d
+
+jobs:
+  ingest:
+    if: github.repository == 'gasserp/probing-data' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      AZURE_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+      AZURE_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+      AZURE_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+      PROBING_STORAGE_ACCOUNT: ${{ vars.PROBING_STORAGE_ACCOUNT }}
+      PROBING_STORAGE_CONTAINER: ${{ vars.PROBING_STORAGE_CONTAINER }}
+      PROBING_STORAGE_RESOURCE_GROUP: ${{ vars.PROBING_STORAGE_RESOURCE_GROUP }}
+
+    steps:
+      - name: Check out data repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Check out pinned ingestion source
+        shell: bash
+        run: |
+          set -euo pipefail
+          source_dir="$RUNNER_TEMP/probing"
+          git init --quiet "$source_dir"
+          git -C "$source_dir" remote add origin https://github.com/gasserp/probing.git
+          git -C "$source_dir" fetch --quiet --no-tags --depth=1 origin "$PROBING_INGEST_REF"
+          git -C "$source_dir" checkout --quiet --detach FETCH_HEAD
+          test "$(git -C "$source_dir" rev-parse HEAD)" = "$PROBING_INGEST_REF"
+
+      - name: Set up Go
+        uses: actions/setup-go@0aaccfd150d50ccaeb58ebd88d36e91967a5f35b # v5.4.0
+        with:
+          go-version: "1.24.0"
+          cache: false
+
+      - name: Build pinned ingestion tool
+        shell: bash
+        run: |
+          set -euo pipefail
+          (
+            cd "$RUNNER_TEMP/probing"
+            go build -trimpath -o "$RUNNER_TEMP/probing-ingest" ./cmd/probing-ingest
+          )
+          echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
+
+      - name: Inspect source registry
+        id: registry
+        shell: bash
+        run: |
+          set -euo pipefail
+          jq -e '
+            .schema_version == "probing.registry/v1" and
+            .repository == "gasserp/probing-data" and
+            (.sources | type == "array")
+          ' registry/sources.json >/dev/null
+          if jq -e 'any(.sources[]; .enabled == true)' registry/sources.json >/dev/null; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "No enabled source is registered; Azure download will be skipped."
+          fi
+
+      - name: Validate Azure configuration
+        if: steps.registry.outputs.enabled == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$AZURE_CLIENT_ID" || { echo "::error::AZURE_CLIENT_ID is not configured"; exit 1; }
+          test -n "$AZURE_TENANT_ID" || { echo "::error::AZURE_TENANT_ID is not configured"; exit 1; }
+          test -n "$AZURE_SUBSCRIPTION_ID" || { echo "::error::AZURE_SUBSCRIPTION_ID is not configured"; exit 1; }
+          test -n "$PROBING_STORAGE_ACCOUNT" || { echo "::error::PROBING_STORAGE_ACCOUNT is not configured"; exit 1; }
+          test -n "$PROBING_STORAGE_CONTAINER" || { echo "::error::PROBING_STORAGE_CONTAINER is not configured"; exit 1; }
+          test -n "$PROBING_STORAGE_RESOURCE_GROUP" || { echo "::error::PROBING_STORAGE_RESOURCE_GROUP is not configured"; exit 1; }
+
+      - name: Log in to Azure with OIDC
+        if: steps.registry.outputs.enabled == 'true'
+        uses: azure/login@7184910d9eb2b1c5e48f7073824a90609bb9b6d6 # v2.3.1
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Download bounded candidate blobs
+        if: steps.registry.outputs.enabled == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/probing-blobs"
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import subprocess
+
+          max_files = 256
+          max_bytes = 64 << 20
+          account = os.environ["PROBING_STORAGE_ACCOUNT"]
+          container = os.environ["PROBING_STORAGE_CONTAINER"]
+          destination = Path(os.environ["RUNNER_TEMP"]) / "probing-blobs"
+
+          result = subprocess.run(
+              [
+                  "az",
+                  "storage",
+                  "blob",
+                  "list",
+                  "--account-name",
+                  account,
+                  "--container-name",
+                  container,
+                  "--auth-mode",
+                  "login",
+                  "--num-results",
+                  str(max_files + 1),
+                  "--query",
+                  "[].{name:name,size:properties.contentLength,etag:properties.etag}",
+                  "--output",
+                  "json",
+                  "--only-show-errors",
+              ],
+              check=True,
+              capture_output=True,
+              text=True,
+          )
+          blobs = json.loads(result.stdout)
+          if not isinstance(blobs, list):
+              raise SystemExit("Azure blob listing returned an unexpected value")
+          if len(blobs) > max_files:
+              raise SystemExit(f"container exceeds the {max_files}-blob input limit")
+
+          total_bytes = 0
+          downloads = []
+          used_targets = set()
+          for entry in blobs:
+              if not isinstance(entry, dict) or set(entry) != {"name", "size", "etag"}:
+                  raise SystemExit("Azure blob listing returned an unexpected entry")
+              name, size, etag = entry["name"], entry["size"], entry["etag"]
+              if not isinstance(name, str) or type(size) is not int or not isinstance(etag, str):
+                  raise SystemExit("Azure blob listing returned invalid field types")
+              if size < 0:
+                  raise SystemExit("Azure blob listing returned a negative size")
+              if not name.endswith(".json"):
+                  continue
+
+              total_bytes += size
+              if total_bytes > max_bytes:
+                  raise SystemExit(f"JSON candidates exceed the {max_bytes}-byte input limit")
+
+              encoded_name = name.encode("utf-8", "surrogatepass")
+              parts = name.split("/")
+              safe = (
+                  0 < len(encoded_name) <= 512
+                  and not name.startswith("/")
+                  and ".." not in name
+                  and all(part not in {"", "."} for part in parts)
+                  and all(len(part.encode("utf-8", "surrogatepass")) <= 255 for part in parts)
+                  and all(ord(character) >= 0x20 and ord(character) != 0x7F for character in name)
+              )
+              if safe:
+                  target = destination.joinpath(*parts)
+              else:
+                  digest = hashlib.sha256(encoded_name).hexdigest()
+                  target = destination / ".unsafe" / f"{digest}.json"
+
+              if target in used_targets:
+                  raise SystemExit("candidate blob names map to the same local path")
+              used_targets.add(target)
+              downloads.append((name, size, etag, target))
+
+          for name, expected_size, etag, target in downloads:
+              target.parent.mkdir(parents=True, exist_ok=True)
+              subprocess.run(
+                  [
+                      "az",
+                      "storage",
+                      "blob",
+                      "download",
+                      "--account-name",
+                      account,
+                      "--container-name",
+                      container,
+                      "--name",
+                      name,
+                      "--file",
+                      str(target),
+                      "--if-match",
+                      etag,
+                      "--max-connections",
+                      "1",
+                      "--auth-mode",
+                      "login",
+                      "--no-progress",
+                      "--only-show-errors",
+                  ],
+                  check=True,
+              )
+              if target.stat().st_size != expected_size:
+                  raise SystemExit("downloaded blob size does not match its listing")
+          PY
+
+      - name: Create empty candidate directory
+        if: steps.registry.outputs.enabled != 'true'
+        shell: bash
+        run: mkdir -p "$RUNNER_TEMP/probing-blobs"
+
+      - name: Validate and ingest candidates
+        id: ingest
+        shell: bash
+        run: |
+          set -uo pipefail
+          set +e
+          probing-ingest \
+            -repo "$GITHUB_WORKSPACE" \
+            -input "$RUNNER_TEMP/probing-blobs" \
+            -repository "$GITHUB_REPOSITORY" \
+            -accepted-manifest "$RUNNER_TEMP/accepted.json"
+          exit_code=$?
+          set -e
+
+          case "$exit_code" in
+            0|3)
+              test -f "$RUNNER_TEMP/accepted.json"
+              echo "exit_code=$exit_code" >> "$GITHUB_OUTPUT"
+              ;;
+            *)
+              echo "::error::probing-ingest failed with exit code $exit_code"
+              exit "$exit_code"
+              ;;
+          esac
+
+      - name: Reject unexpected repository changes
+        shell: bash
+        run: |
+          set -euo pipefail
+          if test -n "$(git status --porcelain --untracked-files=all -- . ':(exclude)data/**')"; then
+            echo "::error::probing-ingest changed files outside data/"
+            git status --short
+            exit 1
+          fi
+
+      - name: Commit and push generated data
+        shell: bash
+        run: |
+          set -euo pipefail
+          git add --all -- data
+          git diff --cached --check
+          if git diff --cached --quiet; then
+            echo "Generated data is unchanged."
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "Ingest telemetry data"
+          git push origin HEAD:main
+
+      - name: Delete accepted blobs by exact name
+        if: steps.registry.outputs.enabled == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - "$RUNNER_TEMP/accepted.json" <<'PY'
+          import json
+          import os
+          import subprocess
+          import sys
+
+          with open(sys.argv[1], encoding="utf-8") as manifest_file:
+              manifest = json.load(manifest_file)
+
+          if set(manifest) != {"schema_version", "blobs"}:
+              raise SystemExit("accepted manifest has unexpected fields")
+          if manifest["schema_version"] != "probing.accepted-manifest/v1":
+              raise SystemExit("accepted manifest has unexpected schema_version")
+          if not isinstance(manifest["blobs"], list) or not all(
+              isinstance(blob, str) for blob in manifest["blobs"]
+          ):
+              raise SystemExit("accepted manifest blobs must be an array of strings")
+
+          account = os.environ["PROBING_STORAGE_ACCOUNT"]
+          container = os.environ["PROBING_STORAGE_CONTAINER"]
+          for blob in manifest["blobs"]:
+              subprocess.run(
+                  [
+                      "az",
+                      "storage",
+                      "blob",
+                      "delete",
+                      "--account-name",
+                      account,
+                      "--container-name",
+                      container,
+                      "--name",
+                      blob,
+                      "--auth-mode",
+                      "login",
+                      "--only-show-errors",
+                  ],
+                  check=True,
+              )
+          PY
+
+      - name: Report quarantines
+        if: steps.ingest.outputs.exit_code == '3'
+        shell: bash
+        run: |
+          echo "::error::probing-ingest quarantined one or more candidates"
+          exit 3
