@@ -1,0 +1,91 @@
+name: ingest
+
+on:
+  schedule:
+    - cron: "5 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  id-token: write
+
+concurrency:
+  group: ingest
+  cancel-in-progress: false
+
+jobs:
+  ingest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          path: probing-data
+
+      - uses: actions/checkout@v5
+        with:
+          repository: gasserp/probing
+          ref: 7b458995219a3b3ebe65fa8dd9d0eb879d93bf9c
+          path: probing
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+
+      - name: Build probing-ingest
+        working-directory: probing
+        run: go build -o ../probing-ingest ./cmd/probing-ingest
+
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Download pending batches
+        run: |
+          set -eu
+          mkdir -p pending
+          az storage blob download-batch \
+            --account-name "${{ vars.PROBING_STORAGE_ACCOUNT }}" \
+            --source "${{ vars.PROBING_STORAGE_CONTAINER }}" \
+            --destination pending \
+            --auth-mode login \
+            --pattern "*.json" \
+            --only-show-errors || echo "no pending blobs"
+
+      - name: Run acceptance and rollup
+        run: |
+          set -eu
+          rc=0
+          ./probing-ingest \
+            -repo=probing-data \
+            -input=pending \
+            -repository=gasserp/probing-data \
+            -accepted-manifest=accepted-manifest.json || rc=$?
+          if [ "$rc" -ne 0 ] && [ "$rc" -ne 3 ]; then
+            exit "$rc"
+          fi
+
+      - name: Commit accepted rollups
+        working-directory: probing-data
+        run: |
+          set -eu
+          git config user.name "probing-data ingest"
+          git config user.email "actions@users.noreply.github.com"
+          git add data
+          if ! git diff --cached --quiet; then
+            git commit -m "Ingest accepted batches"
+            git push
+          fi
+
+      - name: Delete accepted and replayed blobs
+        run: |
+          set -eu
+          jq -r '.blobs[]' accepted-manifest.json | while IFS= read -r blob; do
+            az storage blob delete \
+              --account-name "${{ vars.PROBING_STORAGE_ACCOUNT }}" \
+              --container-name "${{ vars.PROBING_STORAGE_CONTAINER }}" \
+              --name "$blob" \
+              --auth-mode login \
+              --only-show-errors
+          done
