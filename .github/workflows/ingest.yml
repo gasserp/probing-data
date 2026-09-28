@@ -24,7 +24,7 @@ jobs:
       - uses: actions/checkout@v5
         with:
           repository: gasserp/probing
-          ref: 7b458995219a3b3ebe65fa8dd9d0eb879d93bf9c
+          ref: 5e3fd79060024c5fc72f0f81b09fb63368b3cc10
           path: probing
 
       - uses: actions/setup-go@v5
