@@ -10,6 +10,16 @@
       "blob_prefix": "gasserp-azure-weu-01/86c0a41b-b23e-4b45-a35a-ca49b79df272/",
       "enabled": true,
       "kind": "decoy"
+    },
+    {
+      "source_id": "gasserp-home-pi-01",
+      "source_epoch": "f53cdc52-2d87-4534-aad4-70ffc2671d16",
+      "key_id": "gasserp-home-pi-01-ed25519-1",
+      "public_key": "ZHvTqvrjNGjO0l2iN5Ugqtn1xB_I05Q-jxRkaf3y6yU",
+      "blob_prefix": "gasserp-home-pi-01/f53cdc52-2d87-4534-aad4-70ffc2671d16/",
+      "kind": "host",
+      "github_repository": "gasserp/probing-batches",
+      "enabled": true
     }
   ]
 }
