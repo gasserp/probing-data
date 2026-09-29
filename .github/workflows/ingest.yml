@@ -4,6 +4,12 @@ on:
   schedule:
     - cron: "5 * * * *"
   workflow_dispatch:
+    inputs:
+      probing_ref:
+        description: "gasserp/probing ref to build probing-ingest from. Blank = deploy/VERSION on probing main."
+        required: false
+        type: string
+        default: ""
 
 permissions:
   contents: write
@@ -21,10 +27,42 @@ jobs:
         with:
           path: probing-data
 
+      # The collector and this acceptance binary must agree on the batch wire
+      # format, or every new batch is quarantined as invalid_envelope. Both
+      # follow deploy/VERSION in gasserp/probing: its deploy workflow builds the
+      # collector from that ref (and refuses refs whose format is newer than
+      # what VERSION names), and this workflow builds probing-ingest from it.
       - uses: actions/checkout@v5
         with:
           repository: gasserp/probing
-          ref: 5e3fd79060024c5fc72f0f81b09fb63368b3cc10
+          ref: main
+          path: probing-version
+          sparse-checkout: deploy/VERSION
+          sparse-checkout-cone-mode: false
+
+      - name: Resolve probing ref
+        id: probing
+        env:
+          INPUT_REF: ${{ inputs.probing_ref }}
+        run: |
+          set -eu
+          ref="$INPUT_REF"
+          if [ -z "$ref" ]; then
+            ref="$(tr -d '[:space:]' < probing-version/deploy/VERSION)"
+          fi
+          if ! printf '%s' "$ref" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$'; then
+            echo "::error::Invalid probing ref '$ref'"
+            exit 1
+          fi
+          case "$ref" in
+            *..*|*/../*|*/) echo "::error::Invalid probing ref '$ref'"; exit 1 ;;
+          esac
+          echo "ref=$ref" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v5
+        with:
+          repository: gasserp/probing
+          ref: ${{ steps.probing.outputs.ref }}
           path: probing
 
       - uses: actions/setup-go@v5
@@ -33,7 +71,12 @@ jobs:
 
       - name: Build probing-ingest
         working-directory: probing
-        run: go build -o ../probing-ingest ./cmd/probing-ingest
+        env:
+          PROBING_REF: ${{ steps.probing.outputs.ref }}
+        run: |
+          set -eu
+          echo "Building probing-ingest from gasserp/probing@$(git rev-parse HEAD) ($PROBING_REF)"
+          go build -o ../probing-ingest ./cmd/probing-ingest
 
       - uses: azure/login@v2
         with:
