@@ -69,7 +69,7 @@ jobs:
         with:
           go-version: "1.26"
 
-      - name: Build probing-ingest
+      - name: Build probing-ingest and probing-fetch
         working-directory: probing
         env:
           PROBING_REF: ${{ steps.probing.outputs.ref }}
@@ -77,6 +77,10 @@ jobs:
           set -eu
           echo "Building probing-ingest from gasserp/probing@$(git rev-parse HEAD) ($PROBING_REF)"
           go build -o ../probing-ingest ./cmd/probing-ingest
+          # Refs older than contributor-hosted batches have no fetcher.
+          if [ -d cmd/probing-fetch ]; then
+            go build -o ../probing-fetch ./cmd/probing-fetch
+          fi
 
       - uses: azure/login@v2
         with:
@@ -95,6 +99,25 @@ jobs:
             --auth-mode login \
             --pattern "*.json" \
             --only-show-errors || echo "no pending blobs"
+          # Only these may be deleted from the container after acceptance.
+          find pending -type f -name '*.json' -printf '%P\n' | LC_ALL=C sort > azure-blobs.txt
+
+      # Contributors publish signed batches to their own public GitHub
+      # repositories (registry field github_repository). The token only lifts
+      # the API rate limit; the repositories are read anonymously otherwise.
+      - name: Fetch contributor batches
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          if [ ! -x ./probing-fetch ]; then
+            echo "probing ref has no probing-fetch; skipping contributor repositories"
+            exit 0
+          fi
+          ./probing-fetch \
+            -repo=probing-data \
+            -output=pending \
+            -repository=gasserp/probing-data
 
       - name: Run acceptance and rollup
         run: |
@@ -124,7 +147,8 @@ jobs:
       - name: Delete accepted and replayed blobs
         run: |
           set -eu
-          jq -r '.blobs[]' accepted-manifest.json | while IFS= read -r blob; do
+          jq -r '.blobs[]' accepted-manifest.json | LC_ALL=C sort |
+            LC_ALL=C comm -12 - azure-blobs.txt | while IFS= read -r blob; do
             az storage blob delete \
               --account-name "${{ vars.PROBING_STORAGE_ACCOUNT }}" \
               --container-name "${{ vars.PROBING_STORAGE_CONTAINER }}" \
