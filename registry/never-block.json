@@ -1,0 +1,21 @@
+{
+  "schema_version": "probing.never-block/v1",
+  "entries": [
+    {"cidr": "1.1.1.1/32", "reason": "Cloudflare public DNS resolver"},
+    {"cidr": "1.0.0.1/32", "reason": "Cloudflare public DNS resolver"},
+    {"cidr": "2606:4700:4700::1111/128", "reason": "Cloudflare public DNS resolver"},
+    {"cidr": "2606:4700:4700::1001/128", "reason": "Cloudflare public DNS resolver"},
+    {"cidr": "8.8.8.8/32", "reason": "Google Public DNS resolver"},
+    {"cidr": "8.8.4.4/32", "reason": "Google Public DNS resolver"},
+    {"cidr": "2001:4860:4860::8888/128", "reason": "Google Public DNS resolver"},
+    {"cidr": "2001:4860:4860::8844/128", "reason": "Google Public DNS resolver"},
+    {"cidr": "9.9.9.9/32", "reason": "Quad9 public DNS resolver"},
+    {"cidr": "149.112.112.112/32", "reason": "Quad9 public DNS resolver"},
+    {"cidr": "2620:fe::fe/128", "reason": "Quad9 public DNS resolver"},
+    {"cidr": "2620:fe::9/128", "reason": "Quad9 public DNS resolver"},
+    {"cidr": "208.67.222.222/32", "reason": "OpenDNS public DNS resolver"},
+    {"cidr": "208.67.220.220/32", "reason": "OpenDNS public DNS resolver"},
+    {"cidr": "2620:119:35::35/128", "reason": "OpenDNS public DNS resolver"},
+    {"cidr": "2620:119:53::53/128", "reason": "OpenDNS public DNS resolver"}
+  ]
+}
